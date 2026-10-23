@@ -5,7 +5,7 @@ the releases only; the source is not published.
 
 Installed copies update themselves from here: a computer downloads a new version by itself and asks
 to restart, and a phone asks before downloading it. To install by hand, open the
-[latest release](https://github.com/nearestdev/tsukimi-releases/releases/latest) and take the file
+[latest release](https://github.com/amarucouss/tsukimi-releases/releases/latest) and take the file
 for your system:
 
 | System | File |
