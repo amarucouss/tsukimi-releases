@@ -1,0 +1,68 @@
+name: GPUI Windows shaders (Tsukimi)
+
+# Tsukimi's Windows build is made on Linux, where GPUI's build script cannot run the Windows SDK's
+# shader compiler. This compiles Tsukimi's HLSL (GPUI's, with the drawing changes of
+# third_party/gpui-pre-wgpu/TSUKIMI.md ported in: plain icon blending, shadows outside the box,
+# Skia's mask gamma, and LCD per-channel preblend) with fxc.exe, the way gpui-pre-windows' build
+# script does on Windows, and keeps the result as an artifact. Started by hand.
+#
+# The HLSL lives in this public repository under windows-shaders/, copied from the private tsukimi
+# repository's third_party/gpui-pre-windows/src (alpha_correction.hlsl, shaders.hlsl,
+# color_text_raster.hlsl). None of it is secret. The private repository's release build checks the
+# dxbc against the HLSL it ships (SHADERS.txt), so a mismatch is caught there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: A label for the artifact (the tsukimi commit or version)
+        required: true
+        default: dev
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      LABEL: ${{ inputs.label }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Compile with fxc
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fxc = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\fxc.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $fxc) { throw "No fxc.exe in the Windows SDK" }
+          New-Item -ItemType Directory out | Out-Null
+          $modules = "quad", "shadow", "path_rasterization", "path_sprite", "underline",
+            "monochrome_sprite", "subpixel_sprite", "polychrome_sprite", "emoji_rasterization"
+          $src = Resolve-Path windows-shaders
+          foreach ($module in $modules) {
+            $file = if ($module -eq "emoji_rasterization") { "color_text_raster.hlsl" } else { "shaders.hlsl" }
+            foreach ($stage in @(@("vertex", "vs_4_1", "vs"), @("fragment", "ps_4_1", "ps"))) {
+              $name = "$($module.ToUpper())_$($stage[0].ToUpper())_BYTES"
+              & $fxc.FullName /nologo /T $stage[1] /E "${module}_$($stage[0])" `
+                /Fo "out\${module}_$($stage[2]).dxbc" /Fh "out\${module}_$($stage[2]).h" /Vn $name /O3 "$src\$file"
+              if ($LASTEXITCODE -ne 0) { throw "fxc failed on ${module}_$($stage[0])" }
+            }
+          }
+          $lines = @("gpui-pre-windows 0.3.11 with Tsukimi's drawing changes",
+            "fxc $($fxc.FullName)", "fxc file version $($fxc.VersionInfo.FileVersion)",
+            "flags /O3, targets vs_4_1 and ps_4_1", "label $env:LABEL $env:GITHUB_SHA", "")
+          $lines += Get-ChildItem windows-shaders\*.hlsl, out\*.dxbc | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          $lines | Set-Content out\SHADERS.txt -Encoding utf8
+          Get-Content out\SHADERS.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tsukimi-windows-shaders-${{ inputs.label }}
+          path: out
+          if-no-files-found: error
+          retention-days: 30
