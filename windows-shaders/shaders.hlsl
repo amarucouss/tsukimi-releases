@@ -1423,3 +1423,94 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Backdrop blur
+**
+*/
+
+// gpui-pre-wgpu's backdrop.wgsl for D3D11: the frame under the box, copied out, tiled by mirroring at its
+// edges (SkImageFilters::Crop, kMirror), blurred across and then down by Skia's raster three box pass
+// (SkBlurEngine.cpp, ThreeBoxApproxPass) folded into one kernel of whole weights, each pass rounded to a
+// byte, and drawn back inside the box. Shader model 4.1 has no compute stage a pixel shader can feed, so
+// each pass is a pixel shader over a quad covering its target.
+
+cbuffer BackdropParams: register(b2) {
+    float4 backdrop_rect;
+    float2 backdrop_target;
+    float2 backdrop_origin;
+    uint2 backdrop_size;
+    uint backdrop_axis;
+    uint backdrop_taps;
+    uint backdrop_border;
+    uint backdrop_rounding;
+    uint backdrop_factor;
+    uint backdrop_pad;
+};
+
+Texture2D<float4> t_backdrop: register(t0);
+StructuredBuffer<uint> backdrop_weights: register(t1);
+
+float4 backdrop_position(uint vertex_id) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 position = lerp(backdrop_rect.xy, backdrop_rect.zw, unit_vertex);
+    return float4(position / backdrop_target * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+// The index taken into [0, count) by mirroring; the shift by whole periods keeps the remainder unsigned,
+// as an index is never further than the kernel's border before the first pixel.
+uint backdrop_mirror(int index, uint count) {
+    uint period = 2u * count;
+    uint at = uint(index + int(period * (backdrop_border / period + 1u))) % period;
+    return at >= count ? period - 1u - at : at;
+}
+
+// The high 32 bits of a 32 by 32 bit product, from 16 bit halves.
+uint backdrop_high_product(uint a, uint b) {
+    uint a_low = a & 0xffffu;
+    uint a_high = a >> 16u;
+    uint b_low = b & 0xffffu;
+    uint b_high = b >> 16u;
+    uint low = a_low * b_low;
+    uint middle_a = a_high * b_low;
+    uint middle_b = a_low * b_high;
+    uint carry = ((low >> 16u) + (middle_a & 0xffffu) + (middle_b & 0xffffu)) >> 16u;
+    return a_high * b_high + (middle_a >> 16u) + (middle_b >> 16u) + carry;
+}
+
+float4 backdrop_blur_vertex(uint vertex_id: SV_VertexID): SV_Position {
+    return backdrop_position(vertex_id);
+}
+
+float4 backdrop_blur_fragment(float4 position: SV_Position): SV_Target {
+    int2 at = int2(position.xy);
+    uint4 sum = uint4(0u, 0u, 0u, 0u);
+    [loop]
+    for (uint tap = 0u; tap < backdrop_taps; tap++) {
+        int offset = int(tap) - int(backdrop_border);
+        int2 source_at = at;
+        if (backdrop_axis == 0u) {
+            source_at.x = int(backdrop_mirror(at.x + offset, backdrop_size.x));
+        } else {
+            source_at.y = int(backdrop_mirror(at.y + offset, backdrop_size.y));
+        }
+        uint4 texel = uint4(round(t_backdrop.Load(int3(source_at, 0)) * 255.0));
+        sum += backdrop_weights[tap] * texel;
+    }
+    uint4 total = sum + uint4(backdrop_rounding, backdrop_rounding, backdrop_rounding, backdrop_rounding);
+    uint4 divided = uint4(
+        backdrop_high_product(total.x, backdrop_factor),
+        backdrop_high_product(total.y, backdrop_factor),
+        backdrop_high_product(total.z, backdrop_factor),
+        backdrop_high_product(total.w, backdrop_factor));
+    return float4(min(divided, uint4(255u, 255u, 255u, 255u))) / 255.0;
+}
+
+float4 backdrop_composite_vertex(uint vertex_id: SV_VertexID): SV_Position {
+    return backdrop_position(vertex_id);
+}
+
+float4 backdrop_composite_fragment(float4 position: SV_Position): SV_Target {
+    return t_backdrop.Load(int3(int2(floor(position.xy) - backdrop_origin), 0));
+}

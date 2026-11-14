@@ -40,7 +40,8 @@ jobs:
           if (-not $fxc) { throw "No fxc.exe in the Windows SDK" }
           New-Item -ItemType Directory out | Out-Null
           $modules = "quad", "shadow", "path_rasterization", "path_sprite", "underline",
-            "monochrome_sprite", "subpixel_sprite", "polychrome_sprite", "emoji_rasterization"
+            "monochrome_sprite", "subpixel_sprite", "polychrome_sprite", "emoji_rasterization",
+            "backdrop_blur", "backdrop_composite"
           $src = Resolve-Path windows-shaders
           foreach ($module in $modules) {
             $file = if ($module -eq "emoji_rasterization") { "color_text_raster.hlsl" } else { "shaders.hlsl" }
