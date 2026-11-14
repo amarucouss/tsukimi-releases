@@ -555,8 +555,147 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     return output;
 }
 
+float blink_dash_signed(float t, float dash, float period, float total) {
+    float m = t - floor(t / period) * period;
+    float start = t - m;
+    float end = min(dash, total - start);
+    float s = (m < end ? min(m, end - m) : -min(m - end, period - m));
+    s = max(s, t - total);
+    return s;
+}
+
+float2 blink_dash_conic(float r, float t) {
+    float w = 0.70710678;
+    float u = 1.0 - t;
+    float2 p0 = float2(-r, 0.0);
+    float2 p1 = float2(-r, -r);
+    float2 p2 = float2(0.0, -r);
+    float2 numer = u * u * p0 + 2.0 * w * t * u * p1 + t * t * p2;
+    return numer / (u * u + 2.0 * w * t * u + t * t);
+}
+
+float blink_dash_arc_length(float r) {
+    if (r <= 0.0) {
+        return 0.0;
+    }
+    uint lo[24];
+    uint hi[24];
+    lo[0] = 0u;
+    hi[0] = 0x3FFFFFFFu;
+    int top = 1;
+    float measured = 0.0;
+    float scale = 1.0 / float(0x3FFFFFFFu);
+    [loop]
+    for (int step = 0; step < 4096 && top > 0; step++) {
+        top -= 1;
+        uint a = lo[top];
+        uint b = hi[top];
+        uint mid_t = (a + b) >> 1u;
+        float2 pa = blink_dash_conic(r, float(a) * scale);
+        float2 pb = blink_dash_conic(r, float(b) * scale);
+        float2 ph = blink_dash_conic(r, float(mid_t) * scale);
+        float2 off = ph - (pa + pb) * 0.5;
+        if (((b - a) >> 10u) != 0u && max(abs(off.x), abs(off.y)) > 0.5 && top < 22) {
+            lo[top] = mid_t;
+            hi[top] = b;
+            lo[top + 1] = a;
+            hi[top + 1] = mid_t;
+            top += 2;
+        } else {
+            measured += distance(pa, pb);
+        }
+    }
+    return measured;
+}
+
+float blink_rounded_dash_alpha(float2 p, Bounds snapped, Corners radii, float width) {
+    float inset = floor(width * 0.5);
+    float x0 = snapped.origin.x + inset;
+    float y0 = snapped.origin.y + inset;
+    float x1 = max(snapped.origin.x + snapped.size.x - inset, x0);
+    float y1 = max(snapped.origin.y + snapped.size.y - inset, y0);
+    float r_tl = max(radii.top_left - inset, 0.0);
+    float r_tr = max(radii.top_right - inset, 0.0);
+    float r_br = max(radii.bottom_right - inset, 0.0);
+    float r_bl = max(radii.bottom_left - inset, 0.0);
+
+    float quarter = M_PI_F / 2.0;
+    float a_tl = blink_dash_arc_length(r_tl);
+    float a_tr = blink_dash_arc_length(r_tr);
+    float a_br = blink_dash_arc_length(r_br);
+    float a_bl = blink_dash_arc_length(r_bl);
+    float s_t = x1 - x0 - r_tl - r_tr;
+    float s_r = y1 - y0 - r_tr - r_br;
+    float s_b = x1 - x0 - r_br - r_bl;
+    float s_l = y1 - y0 - r_bl - r_tl;
+    float at_tr = s_t;
+    float at_r = at_tr + a_tr;
+    float at_br = at_r + s_r;
+    float at_b = at_br + a_br;
+    float at_bl = at_b + s_b;
+    float at_l = at_bl + a_bl;
+    float at_tl = at_l + s_l;
+    float total = at_tl + a_tl;
+    float measured = floor(total);
+
+    float dash = width * (width >= 3.0 ? 2.0 : 3.0);
+    float gap = width * (width >= 3.0 ? 1.0 : 2.0);
+    if (measured <= dash * 2.0) {
+        return 1.0;
+    }
+    float two = 2.0 * dash + 2.0 * gap;
+    if (measured <= two) {
+        dash *= measured / two;
+        gap *= measured / two;
+    } else {
+        float fewer = floor(measured / (dash + gap));
+        float more = fewer + 1.0;
+        float fewer_gap = (measured - fewer * dash) / fewer;
+        float more_gap = (measured - more * dash) / more;
+        gap = ((more_gap <= 0.0 || abs(fewer_gap - gap) < abs(more_gap - gap)) ? fewer_gap : more_gap);
+    }
+
+    float t = 0.0;
+    float stretch = 1.0;
+    if (r_tl > 0.0 && p.x < x0 + r_tl && p.y < y0 + r_tl) {
+        float2 v = p - float2(x0 + r_tl, y0 + r_tl);
+        t = at_tl + a_tl / quarter * clamp(atan2(-v.y, -v.x), 0.0, quarter);
+        stretch = length(v) * quarter / a_tl;
+    } else if (r_tr > 0.0 && p.x > x1 - r_tr && p.y < y0 + r_tr) {
+        float2 v = p - float2(x1 - r_tr, y0 + r_tr);
+        t = at_tr + a_tr / quarter * clamp(atan2(v.x, -v.y), 0.0, quarter);
+        stretch = length(v) * quarter / a_tr;
+    } else if (r_br > 0.0 && p.x > x1 - r_br && p.y > y1 - r_br) {
+        float2 v = p - float2(x1 - r_br, y1 - r_br);
+        t = at_br + a_br / quarter * clamp(atan2(v.y, v.x), 0.0, quarter);
+        stretch = length(v) * quarter / a_br;
+    } else if (r_bl > 0.0 && p.x < x0 + r_bl && p.y > y1 - r_bl) {
+        float2 v = p - float2(x0 + r_bl, y1 - r_bl);
+        t = at_bl + a_bl / quarter * clamp(atan2(-v.x, v.y), 0.0, quarter);
+        stretch = length(v) * quarter / a_bl;
+    } else {
+        float4 to_side = abs(float4(p.y - y0, p.x - x1, p.y - y1, p.x - x0));
+        float nearest = min(min(to_side.x, to_side.y), min(to_side.z, to_side.w));
+        if (nearest == to_side.x) {
+            t = p.x - (x0 + r_tl);
+        } else if (nearest == to_side.y) {
+            t = at_r + p.y - (y0 + r_tr);
+        } else if (nearest == to_side.z) {
+            t = at_b + (x1 - r_br) - p.x;
+        } else {
+            t = at_l + (y1 - r_bl) - p.y;
+        }
+    }
+    t = clamp((t < 0.0 ? t + total : t), 0.0, total);
+    float s = blink_dash_signed(t, dash, dash + gap, total);
+    return saturate(s * stretch + 0.5);
+}
+
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
+    if (quad.border_style == 2) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
 
@@ -666,8 +805,13 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
-        // Dashed border logic when border_style == 1
-        if (quad.border_style == 1) {
+        bool uniform_border = quad.border_widths.top == quad.border_widths.right
+            && quad.border_widths.top == quad.border_widths.bottom
+            && quad.border_widths.top == quad.border_widths.left;
+        if (quad.border_style == 1 && !unrounded && uniform_border) {
+            border_color.a *= blink_rounded_dash_alpha(input.position.xy, quad.bounds,
+                quad.corner_radii, quad.border_widths.top);
+        } else if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1
             float t = 0.0;
