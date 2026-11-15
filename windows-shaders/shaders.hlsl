@@ -529,11 +529,23 @@ struct QuadFragmentInput {
 
 StructuredBuffer<Quad> quads: register(t1);
 
+// The whole device pixels a quad's bounds touch: a quad drawn through a paint transform
+// (`Window::with_paint_scale`) has edges between pixels, which the fragment stage antialiases, as a
+// browser draws a transformed box. A snapped quad covers exactly its own pixels.
+Bounds covering_pixels(Bounds bounds) {
+    float2 origin = floor(bounds.origin);
+    Bounds covered;
+    covered.origin = origin;
+    covered.size = ceil(bounds.origin + bounds.size) - origin;
+    return covered;
+}
+
 QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     uint quad_id = batch_start_index + instance_id;
     Quad quad = quads[quad_id];
-    float4 device_position = to_device_position(unit_vertex, quad.bounds);
+    Bounds covered = covering_pixels(quad.bounds);
+    float4 device_position = to_device_position(unit_vertex, covered);
 
     GradientColor gradient = prepare_gradient_color(
         quad.background.tag,
@@ -541,7 +553,7 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
         quad.background.solid,
         quad.background.colors
     );
-    float4 clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, covered, quad.content_mask);
     float4 border_color = hsla_to_rgba(quad.border_color);
 
     QuadVertexOutput output;
@@ -704,12 +716,13 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         quad.corner_radii.bottom_left == 0.0 &&
         quad.corner_radii.bottom_right == 0.0;
 
-    // Fast path when the quad is not rounded and doesn't have any border
+    // Fast path when the quad is not rounded, doesn't have any border, and lies on whole pixels
+    bool whole = all(frac(quad.bounds.origin) == float2(0.0, 0.0)) && all(frac(quad.bounds.size) == float2(0.0, 0.0));
     if (quad.border_widths.top == 0.0 &&
         quad.border_widths.left == 0.0 &&
         quad.border_widths.right == 0.0 &&
         quad.border_widths.bottom == 0.0 &&
-        unrounded) {
+        unrounded && whole) {
         return background_color;
     }
 
@@ -767,8 +780,12 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         straight_border_inner_corner_to_point.x < -antialias_threshold &&
         straight_border_inner_corner_to_point.y < -antialias_threshold;
 
-    // Fast path for points that must be part of the background
-    if (is_within_inner_straight_border && !is_near_rounded_corner) {
+    // Fast path for points that must be part of the background. A side without a border is reduced to
+    // -antialias_threshold, so between pixels the pixels within half a pixel of the outer edge take the
+    // antialiased path.
+    bool clear_of_edge = whole ||
+        (corner_to_point.x < -antialias_threshold && corner_to_point.y < -antialias_threshold);
+    if (is_within_inner_straight_border && !is_near_rounded_corner && clear_of_edge) {
         return background_color;
     }
 
@@ -802,7 +819,18 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // Negative when inside the border
     float border_sdf = max(inner_sdf, outer_sdf);
 
-    float4 color = background_color;
+    // A rounded box with a border that lies between pixels (a paint transform) has its background
+    // clipped by the same antialiased rounded rect it is filled with, as Blink clips it to avoid a
+    // background bleeding past the border: at the outer edge it counts its coverage twice.
+    float coverage = saturate(antialias_threshold - outer_sdf);
+    float4 background = background_color;
+    bool bordered = max(max(quad.border_widths.top, quad.border_widths.bottom),
+        max(quad.border_widths.left, quad.border_widths.right)) > 0.0;
+    if (!whole && !unrounded && bordered && coverage > 0.0) {
+        background.a *= coverage;
+    }
+
+    float4 color = background;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
         bool uniform_border = quad.border_widths.top == quad.border_widths.right
@@ -982,12 +1010,12 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
         // Blend the border on top of the background and then linearly interpolate
         // between the two as we slide inside the background.
-        float4 blended_border = over(background_color, border_color);
-        color = lerp(background_color, blended_border,
+        float4 blended_border = over(background, border_color);
+        color = lerp(background, blended_border,
                     saturate(antialias_threshold - inner_sdf));
     }
 
-    return color * float4(1.0, 1.0, 1.0, saturate(antialias_threshold - outer_sdf));
+    return color * float4(1.0, 1.0, 1.0, coverage);
 }
 
 /*
