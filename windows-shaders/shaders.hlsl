@@ -703,6 +703,549 @@ float blink_rounded_dash_alpha(float2 p, Bounds snapped, Corners radii, float wi
     return saturate(s * stretch + 0.5);
 }
 
+// --- Skia's analytic antialiasing of a rounded rect, as Chrome rasterizes it on the CPU --- //
+// The WGSL of gpui-pre-wgpu's shaders_aaa.wgsl, ported edge_color for edge_color (its comments say what each
+// part reproduces: SkScan_AAAPath.cpp's convex and general walkers, SkAnalyticEdge's quarter-pixel
+// snapping, SkEdgeBuilder's conics, Blink's bleed avoidance, Skia's thin strokes as hairlines).
+
+static const uint AAA_SIDE = 40u;
+static const int AAA_FIXED_ONE = 65536;
+
+static float aaa_ux[80];
+static float aaa_uy[80];
+static float aaa_ly[80];
+static float aaa_dx[80];
+static uint aaa_flags[80];
+static uint aaa_count[2];
+static float aaa_hair_alpha;
+
+int aaa_snap_y(int y) {
+    return ((y + (AAA_FIXED_ONE >> 3)) >> 14) << 14;
+}
+
+int aaa_fixed(float v) {
+    return (((int)(v * 256.0)) << 10) >> 2;
+}
+
+int aaa_bit_length(uint v) {
+    return v == 0u ? 0 : firstbithigh(v) + 1;
+}
+
+void aaa_push(uint side, float ux, float uy, float ly, float dx, bool first, bool more, bool steady) {
+    uint n = aaa_count[side];
+    if (n >= AAA_SIDE) {
+        return;
+    }
+    uint i = side * AAA_SIDE + n;
+    aaa_ux[i] = ux;
+    aaa_uy[i] = uy;
+    aaa_ly[i] = ly;
+    aaa_dx[i] = dx;
+    aaa_flags[i] = (first ? 1u : 0u) | (more ? 2u : 0u) | ((more && steady) ? 4u : 0u);
+    aaa_count[side] = n + 1u;
+}
+
+void aaa_line(uint side, float2 a, float2 b) {
+    int x0 = aaa_fixed(a.x);
+    int y0 = aaa_snap_y(aaa_fixed(a.y));
+    int x1 = aaa_fixed(b.x);
+    int y1 = aaa_snap_y(aaa_fixed(b.y));
+    if (y0 > y1) {
+        int tx = x0; x0 = x1; x1 = tx;
+        int ty = y0; y0 = y1; y1 = ty;
+    }
+    int dy = (y1 - y0) >> 10;
+    if (dy == 0) {
+        return;
+    }
+    float dx = (float)((x1 - x0) >> 10) / (float)dy;
+    aaa_push(side, (float)x0 / 65536.0, (float)y0 / 65536.0, (float)y1 / 65536.0, dx, true, false, false);
+}
+
+void aaa_quad(uint side, float2 p0, float2 p1, float2 p2) {
+    int x0 = (int)(p0.x * 256.0);
+    int y0 = (int)(p0.y * 256.0);
+    int x1 = (int)(p1.x * 256.0);
+    int y1 = (int)(p1.y * 256.0);
+    int x2 = (int)(p2.x * 256.0);
+    int y2 = (int)(p2.y * 256.0);
+    if (y0 > y2) {
+        int tx = x0; x0 = x2; x2 = tx;
+        int ty = y0; y0 = y2; y2 = ty;
+    }
+    if (((y0 + 32) >> 6) == ((y2 + 32) >> 6)) {
+        return;
+    }
+    int ddx = abs(((x1 << 1) - x0 - x2) >> 2);
+    int ddy = abs(((y1 << 1) - y0 - y2) >> 2);
+    int dist = ddx > ddy ? ddx + (ddy >> 1) : ddy + (ddx >> 1);
+    dist = (dist + 16) >> 5;
+    int cs = clamp(aaa_bit_length((uint)dist) >> 1, 1, 6);
+    int count = 1 << cs;
+    int s = cs - 1;
+    int ax = (x0 - x1 - x1 + x2) << 9;
+    int bx = (x1 - x0) << 10;
+    int ay = (y0 - y1 - y1 + y2) << 9;
+    int by = (y1 - y0) << 10;
+    int qdx = (bx + (ax >> cs)) >> 2;
+    int qddx = (ax >> (cs - 1)) >> 2;
+    int qdy = (by + (ay >> cs)) >> 2;
+    int qddy = (ay >> (cs - 1)) >> 2;
+    int lastx = (x2 << 10) >> 2;
+    int lasty = aaa_snap_y((y2 << 10) >> 2);
+    int oldx = (x0 << 10) >> 2;
+    int oldy = aaa_snap_y((y0 << 10) >> 2);
+    int sx = oldx;
+    int sy = oldy;
+    bool first = true;
+    [loop]
+    for (int guard = 0; guard < 64 && count > 0; guard += 1) {
+        int newx;
+        int newy;
+        int nsx;
+        int nsy;
+        float slope = 0.0;
+        bool has_slope = false;
+        count -= 1;
+        if (count > 0) {
+            newx = oldx + (qdx >> s);
+            newy = oldy + (qdy >> s);
+            if (abs(qdy >> s) >= AAA_FIXED_ONE * 2 && (abs(qdy) << 6) > abs(qdx)) {
+                int d = (newy - sy) >> 10;
+                has_slope = d != 0;
+                slope = has_slope ? (float)((newx - sx) >> 10) / (float)d : 0.0;
+                nsy = min(lasty, ((newy + (AAA_FIXED_ONE >> 1)) >> 16) << 16);
+                nsx = newx - (int)floor(floor(slope * 65536.0) * (float)(newy - nsy) / 65536.0);
+            } else {
+                nsy = min(lasty, aaa_snap_y(newy));
+                nsx = newx;
+                int d = (nsy - sy) >> 10;
+                has_slope = d != 0;
+                slope = has_slope ? (float)((newx - sx) >> 10) / (float)d : 0.0;
+            }
+            qdx += qddx;
+            qdy += qddy;
+        } else {
+            newx = lastx;
+            newy = lasty;
+            nsx = newx;
+            nsy = newy;
+            int d = (newy - sy) >> 10;
+            has_slope = d != 0;
+            slope = has_slope ? (float)((newx - sx) >> 10) / (float)d : 0.0;
+        }
+        if (has_slope && nsy > sy) {
+            bool steady = (abs(qdx) >> 1) >= abs(qddx) && (abs(qdy) >> 1) >= abs(qddy)
+                && ((qdy - qddy) >> s) >= AAA_FIXED_ONE;
+            aaa_push(side, (float)sx / 65536.0, (float)sy / 65536.0, (float)nsy / 65536.0, slope, first, count > 0, steady);
+            first = false;
+            sx = nsx;
+            sy = nsy;
+        }
+        oldx = newx;
+        oldy = newy;
+    }
+}
+
+uint aaa_conic_quads(float2 top, float2 control, float2 bottom, out float2 c0[8], out float2 c1[8], out float2 c2[8]) {
+    float w0 = 0.70710677;
+    float a = w0 - 1.0;
+    float k = a / (4.0 * (2.0 + a));
+    float2 e = k * (top - 2.0 * control + bottom);
+    float error = sqrt(e.x * e.x + e.y * e.y);
+    uint pow2 = 0u;
+    [loop]
+    for (; pow2 < 3u; pow2 += 1u) {
+        if (error <= 0.25) {
+            break;
+        }
+        error *= 0.25;
+    }
+    float cw[8];
+    c0[0] = top;
+    c1[0] = control;
+    c2[0] = bottom;
+    cw[0] = w0;
+    uint n = 1u;
+    [loop]
+    for (uint level = 0u; level < pow2; level += 1u) {
+        [loop]
+        for (uint j = 0u; j < n; j += 1u) {
+            uint i = n - 1u - j;
+            float scale = 1.0 / (1.0 + cw[i]);
+            float2 t0 = c0[i] * scale;
+            float2 t1 = c1[i] * (cw[i] * scale);
+            float2 t2 = c2[i] * scale;
+            float2 mid = 0.5 * t0 + t1 + 0.5 * t2;
+            float nw = sqrt(0.5 + cw[i] * 0.5);
+            float2 first = c0[i];
+            float2 last = c2[i];
+            c0[2u * i] = first;
+            c1[2u * i] = t0 + t1;
+            c2[2u * i] = mid;
+            c0[2u * i + 1u] = mid;
+            c1[2u * i + 1u] = t1 + t2;
+            c2[2u * i + 1u] = last;
+            cw[2u * i] = nw;
+            cw[2u * i + 1u] = nw;
+        }
+        n *= 2u;
+    }
+    return n;
+}
+
+void aaa_corner(uint side, float2 top, float2 control, float2 bottom) {
+    float2 c0[8];
+    float2 c1[8];
+    float2 c2[8];
+    uint n = aaa_conic_quads(top, control, bottom, c0, c1, c2);
+    [loop]
+    for (uint i = 0u; i < n; i += 1u) {
+        aaa_quad(side, c0[i], c1[i], c2[i]);
+    }
+}
+
+void aaa_build(Bounds bounds, Corners radii, bool top_half) {
+    float l = bounds.origin.x;
+    float t = bounds.origin.y;
+    float r = bounds.origin.x + bounds.size.x;
+    float b = bounds.origin.y + bounds.size.y;
+    aaa_count[0] = 0u;
+    aaa_count[1] = 0u;
+    if (top_half) {
+        if (radii.top_left > 0.0) {
+            aaa_corner(0u, float2(l + radii.top_left, t), float2(l, t), float2(l, t + radii.top_left));
+        }
+        aaa_line(0u, float2(l, t + radii.top_left), float2(l, b - radii.bottom_left));
+        if (radii.top_right > 0.0) {
+            aaa_corner(1u, float2(r - radii.top_right, t), float2(r, t), float2(r, t + radii.top_right));
+        }
+        aaa_line(1u, float2(r, t + radii.top_right), float2(r, b - radii.bottom_right));
+    } else {
+        aaa_line(0u, float2(l, t + radii.top_left), float2(l, b - radii.bottom_left));
+        if (radii.bottom_left > 0.0) {
+            aaa_corner(0u, float2(l, b - radii.bottom_left), float2(l, b), float2(l + radii.bottom_left, b));
+        }
+        aaa_line(1u, float2(r, t + radii.top_right), float2(r, b - radii.bottom_right));
+        if (radii.bottom_right > 0.0) {
+            aaa_corner(1u, float2(r, b - radii.bottom_right), float2(r, b), float2(r - radii.bottom_right, b));
+        }
+    }
+}
+
+float aaa_clamped_mean(float a, float b) {
+    if (abs(b - a) < 1e-6) {
+        return saturate(0.5 * (a + b));
+    }
+    float ga = a <= 0.0 ? 0.0 : (a >= 1.0 ? a - 0.5 : 0.5 * a * a);
+    float gb = b <= 0.0 ? 0.0 : (b >= 1.0 ? b - 0.5 : 0.5 * b * b);
+    return (gb - ga) / (b - a);
+}
+
+int aaa_find(uint side, float y) {
+    uint n = aaa_count[side];
+    [loop]
+    for (uint j = 0u; j < n; j += 1u) {
+        uint i = side * AAA_SIDE + j;
+        if (aaa_uy[i] <= y && y < aaa_ly[i]) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int aaa_next_edge(uint side, int after_index) {
+    int end = (int)(side * AAA_SIDE + aaa_count[side]);
+    [loop]
+    for (int j = after_index + 1; j < end; j += 1) {
+        if ((aaa_flags[j] & 1u) != 0u) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+bool aaa_before(int a, int b) {
+    return aaa_uy[a] < aaa_uy[b] || (aaa_uy[a] == aaa_uy[b] && aaa_ux[a] <= aaa_ux[b]);
+}
+
+bool aaa_smooth_one(int segment, int next) {
+    if ((aaa_flags[segment] & 2u) != 0u) {
+        return (aaa_flags[segment] & 4u) != 0u;
+    }
+    return next >= 0 && abs(aaa_dx[next] - aaa_dx[segment]) <= 1.0 && aaa_ly[next] - aaa_uy[next] >= 1.0;
+}
+
+bool aaa_steady(int li, int ri) {
+    int l1 = aaa_next_edge(0u, li);
+    int r1 = aaa_next_edge(1u, ri);
+    int next = -1;
+    int after = -1;
+    if (l1 >= 0 && (r1 < 0 || aaa_before(l1, r1))) {
+        next = l1;
+        int l2 = aaa_next_edge(0u, l1);
+        after = (l2 >= 0 && (r1 < 0 || aaa_before(l2, r1))) ? l2 : r1;
+    } else if (r1 >= 0) {
+        next = r1;
+        int r2 = aaa_next_edge(1u, r1);
+        after = (r2 >= 0 && (l1 < 0 || aaa_before(r2, l1))) ? r2 : l1;
+    }
+    if (next < 0) {
+        return false;
+    }
+    float lb = aaa_ly[li];
+    float rb = aaa_ly[ri];
+    if (lb + 1.0 < rb) {
+        return aaa_smooth_one(li, next);
+    }
+    if (lb > rb + 1.0) {
+        return aaa_smooth_one(ri, next);
+    }
+    if (after < 0) {
+        return false;
+    }
+    int a = next;
+    int b = after;
+    if (aaa_ux[after] < aaa_ux[next]) {
+        a = after;
+        b = next;
+    }
+    return aaa_smooth_one(li, a) && aaa_smooth_one(ri, b);
+}
+
+float aaa_snap16(float v) {
+    return floor(v * 16.0 + 0.5) / 16.0;
+}
+
+float aaa_rrect(float2 pixel, Bounds bounds, Corners radii, bool convex) {
+    bool top_half = pixel.y + 0.5 < bounds.origin.y + bounds.size.y * 0.5;
+    aaa_build(bounds, radii, top_half);
+    if (aaa_count[0] == 0u || aaa_count[1] == 0u) {
+        return 0.0;
+    }
+    float row_end = pixel.y + 1.0;
+    float y = pixel.y;
+    float covered = 0.0;
+    [loop]
+    for (int guard = 0; guard < 48 && y < row_end; guard += 1) {
+        int li = aaa_find(0u, y);
+        int ri = aaa_find(1u, y);
+        if (li < 0 || ri < 0) {
+            float first = min(aaa_uy[0], aaa_uy[AAA_SIDE]);
+            if (y < first && first < row_end) {
+                y = first;
+                continue;
+            }
+            break;
+        }
+        float lb = aaa_ly[li];
+        float rb = aaa_ly[ri];
+        float bottom = min(lb, rb);
+        bool vertical = aaa_dx[li] == 0.0 && aaa_dx[ri] == 0.0;
+        if (convex && aaa_steady(li, ri)) {
+            bottom = ceil(bottom);
+        }
+        float end = min(bottom, row_end);
+        float l0 = aaa_ux[li] + aaa_dx[li] * (y - aaa_uy[li]);
+        float l1 = aaa_ux[li] + aaa_dx[li] * (end - aaa_uy[li]);
+        float r0 = aaa_ux[ri] + aaa_dx[ri] * (y - aaa_uy[ri]);
+        float r1 = aaa_ux[ri] + aaa_dx[ri] * (end - aaa_uy[ri]);
+        if (convex && !vertical) {
+            l0 = aaa_snap16(l0);
+            l1 = aaa_snap16(l1);
+            r0 = aaa_snap16(r0);
+            r1 = aaa_snap16(r1);
+        }
+        covered += (end - y) * max(0.0, aaa_clamped_mean(r0 - pixel.x, r1 - pixel.x)
+            - aaa_clamped_mean(l0 - pixel.x, l1 - pixel.x));
+        y = end;
+    }
+    return saturate(covered);
+}
+
+float aaa_rect(float2 pixel, Bounds bounds) {
+    float2 lo = round(bounds.origin * 256.0) / 256.0;
+    float2 hi = round((bounds.origin + bounds.size) * 256.0) / 256.0;
+    float2 span = max(min(hi, pixel + 1.0) - max(lo, pixel), float2(0.0, 0.0));
+    return span.x * span.y;
+}
+
+Bounds aaa_inset(Bounds bounds, Edges widths) {
+    Bounds inner;
+    inner.origin = bounds.origin + float2(widths.left, widths.top);
+    inner.size = max(bounds.size - float2(widths.left + widths.right, widths.top + widths.bottom), float2(0.0, 0.0));
+    return inner;
+}
+
+Corners aaa_inset_radii(Corners radii, Edges widths) {
+    Corners inner;
+    inner.top_left = max(0.0, radii.top_left - max(widths.top, widths.left));
+    inner.top_right = max(0.0, radii.top_right - max(widths.top, widths.right));
+    inner.bottom_right = max(0.0, radii.bottom_right - max(widths.bottom, widths.right));
+    inner.bottom_left = max(0.0, radii.bottom_left - max(widths.bottom, widths.left));
+    return inner;
+}
+
+float aaa_hair_line(int2 pixel, float2 a, float2 b) {
+    int x0 = (int)(a.x * 64.0);
+    int y0 = (int)(a.y * 64.0);
+    int x1 = (int)(b.x * 64.0);
+    int y1 = (int)(b.y * 64.0);
+    bool horizontal = abs(x1 - x0) > abs(y1 - y0);
+    if (!horizontal) {
+        int tx = x0; x0 = y0; y0 = tx;
+        int tx1 = x1; x1 = y1; y1 = tx1;
+    }
+    if (x0 > x1) {
+        int tx = x0; x0 = x1; x1 = tx;
+        int ty = y0; y0 = y1; y1 = ty;
+    }
+    int major = horizontal ? pixel.x : pixel.y;
+    int minor = horizontal ? pixel.y : pixel.x;
+    int start = x0 >> 6;
+    int stop = (x1 + 63) >> 6;
+    if (x0 == x1 || major < start || major >= stop) {
+        return 0.0;
+    }
+    int slope = 0;
+    int fstart = y0 << 10;
+    if (y0 != y1) {
+        slope = (int)floor((float)(y1 - y0) * 65536.0 / (float)(x1 - x0));
+        fstart = (y0 << 10) + ((slope * (32 - (x0 & 63)) + 32) >> 6);
+    }
+    int start_coverage = 64 - (x0 & 63);
+    int stop_coverage = x1 & 63;
+    if (stop - start == 1) {
+        start_coverage = x1 - x0;
+        stop_coverage = 0;
+    }
+    int f = fstart + slope * (major - start) + (AAA_FIXED_ONE >> 1);
+    int lower = f >> 16;
+    int fraction = (f >> 8) & 255;
+    int alpha = 0;
+    if (minor == lower) {
+        alpha = fraction;
+    } else if (minor == lower - 1) {
+        alpha = 255 - fraction;
+    }
+    if (major == start) {
+        alpha = (alpha * start_coverage) >> 6;
+    } else if (stop_coverage > 0 && major == stop - 1) {
+        alpha = (alpha * stop_coverage) >> 6;
+    }
+    return aaa_hair_alpha * (float)alpha / 255.0;
+}
+
+float aaa_hair_quad(int2 pixel, float2 p0, float2 p1, float2 p2, float kept) {
+    float2 d = abs(0.5 * (p0 + p2) - p1);
+    uint2 id = (uint2)ceil(d);
+    uint dist = id.x > id.y ? id.x + (id.y >> 1u) : id.y + (id.x >> 1u);
+    uint level = min(5u, (uint)(aaa_bit_length(dist) + 1) >> 1u);
+    uint lines = 1u << level;
+    float2 qa = p2 - 2.0 * p1 + p0;
+    float2 qb = 2.0 * (p1 - p0);
+    float left = kept;
+    float2 previous = p0;
+    [loop]
+    for (uint i = 1u; i <= lines; i += 1u) {
+        float t = (float)i / (float)lines;
+        float2 at = i == lines ? p2 : (qa * t + qb) * t + p0;
+        left *= 1.0 - aaa_hair_line(pixel, previous, at);
+        previous = at;
+    }
+    return left;
+}
+
+float aaa_hair_corner(int2 pixel, float2 top, float2 control, float2 bottom, float kept) {
+    float2 c0[8];
+    float2 c1[8];
+    float2 c2[8];
+    uint n = aaa_conic_quads(top, control, bottom, c0, c1, c2);
+    float left = kept;
+    [loop]
+    for (uint i = 0u; i < n; i += 1u) {
+        left = aaa_hair_quad(pixel, c0[i], c1[i], c2[i], left);
+    }
+    return left;
+}
+
+float aaa_hair_rrect(float2 pixel, Bounds bounds, Corners radii) {
+    int2 p = (int2)pixel;
+    float l = bounds.origin.x;
+    float t = bounds.origin.y;
+    float r = bounds.origin.x + bounds.size.x;
+    float b = bounds.origin.y + bounds.size.y;
+    float left = 1.0;
+    left *= 1.0 - aaa_hair_line(p, float2(l + radii.top_left, t), float2(r - radii.top_right, t));
+    left *= 1.0 - aaa_hair_line(p, float2(r, t + radii.top_right), float2(r, b - radii.bottom_right));
+    left *= 1.0 - aaa_hair_line(p, float2(r - radii.bottom_right, b), float2(l + radii.bottom_left, b));
+    left *= 1.0 - aaa_hair_line(p, float2(l, b - radii.bottom_left), float2(l, t + radii.top_left));
+    if (radii.top_left > 0.0) {
+        left = aaa_hair_corner(p, float2(l + radii.top_left, t), float2(l, t), float2(l, t + radii.top_left), left);
+    }
+    if (radii.top_right > 0.0) {
+        left = aaa_hair_corner(p, float2(r - radii.top_right, t), float2(r, t), float2(r, t + radii.top_right), left);
+    }
+    if (radii.bottom_right > 0.0) {
+        left = aaa_hair_corner(p, float2(r, b - radii.bottom_right), float2(r, b), float2(r - radii.bottom_right, b), left);
+    }
+    if (radii.bottom_left > 0.0) {
+        left = aaa_hair_corner(p, float2(l, b - radii.bottom_left), float2(l, b), float2(l + radii.bottom_left, b), left);
+    }
+    return left;
+}
+
+float4 blink_border_ring(float2 pixel, Bounds bounds, Corners radii, Edges widths, Bounds inner,
+        Corners inner_radii, float4 edge_color) {
+    float w = widths.top;
+    bool uniform_width = widths.right == w && widths.bottom == w && widths.left == w;
+    if (uniform_width && w <= 1.0) {
+        Edges half_width;
+        half_width.top = w * 0.5;
+        half_width.right = w * 0.5;
+        half_width.bottom = w * 0.5;
+        half_width.left = w * 0.5;
+        float alpha = floor(edge_color.a * 255.0 + 0.5);
+        aaa_hair_alpha = floor(alpha * floor(w * 256.0) / 256.0) / 255.0;
+        float middle = aaa_hair_rrect(pixel, aaa_inset(bounds, half_width), aaa_inset_radii(radii, half_width));
+        float4 shade = float4(edge_color.a > 0.0 ? edge_color.rgb / edge_color.a : float3(0.0, 0.0, 0.0), 1.0);
+        return shade * (1.0 - middle);
+    }
+    float ring = max(0.0, aaa_rrect(pixel, bounds, radii, false) - aaa_rrect(pixel, inner, inner_radii, false));
+    return edge_color * ring;
+}
+
+float4 blink_scaled_box(float2 pixel, Bounds bounds, Corners radii, Edges widths, float4 background,
+        float4 border) {
+    bool bordered = max(max(widths.top, widths.bottom), max(widths.left, widths.right)) > 0.0;
+    float4 fill = float4(background.rgb * background.a, background.a);
+    float4 edge_color = float4(border.rgb * border.a, border.a);
+    if (!bordered) {
+        return fill * aaa_rrect(pixel, bounds, radii, true);
+    }
+    Bounds inner = aaa_inset(bounds, widths);
+    Corners inner_radii = aaa_inset_radii(radii, widths);
+    if (background.a <= 0.0) {
+        return blink_border_ring(pixel, bounds, radii, widths, inner, inner_radii, edge_color);
+    }
+    bool every_side = min(min(widths.top, widths.bottom), min(widths.left, widths.right)) > 0.0;
+    if (every_side && border.a >= 1.0) {
+        Edges half_width;
+        half_width.top = widths.top * 0.5;
+        half_width.right = widths.right * 0.5;
+        half_width.bottom = widths.bottom * 0.5;
+        half_width.left = widths.left * 0.5;
+        float shrunk = aaa_rrect(pixel, aaa_inset(bounds, half_width), aaa_inset_radii(radii, half_width), true);
+        float4 ring = blink_border_ring(pixel, bounds, radii, widths, inner, inner_radii, edge_color);
+        float4 below = fill * shrunk;
+        return ring + below * (1.0 - ring.a);
+    }
+    float rect = aaa_rect(pixel, bounds);
+    float outside_inner = 1.0 - aaa_rrect(pixel, inner, inner_radii, false);
+    float4 layer = edge_color * outside_inner + fill * rect * (1.0 - edge_color.a * outside_inner);
+    return layer * aaa_rrect(pixel, bounds, radii, true);
+}
+
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     if (quad.border_style == 2) {
@@ -718,6 +1261,19 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
 
     // Fast path when the quad is not rounded, doesn't have any border, and lies on whole pixels
     bool whole = all(frac(quad.bounds.origin) == float2(0.0, 0.0)) && all(frac(quad.bounds.size) == float2(0.0, 0.0));
+    bool borderless = quad.border_widths.top == 0.0 && quad.border_widths.left == 0.0 &&
+        quad.border_widths.right == 0.0 && quad.border_widths.bottom == 0.0;
+    if (!whole && unrounded && borderless) {
+        return background_color * float4(1.0, 1.0, 1.0, aaa_rect(floor(input.position.xy), quad.bounds));
+    }
+    if (!whole && !unrounded && quad.border_style == 0) {
+        float4 painted = blink_scaled_box(floor(input.position.xy), quad.bounds, quad.corner_radii,
+            quad.border_widths, background_color, input.border_color);
+        if (painted.a <= 0.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
+        return float4(painted.rgb / painted.a, painted.a);
+    }
     if (quad.border_widths.top == 0.0 &&
         quad.border_widths.left == 0.0 &&
         quad.border_widths.right == 0.0 &&
@@ -819,16 +1375,8 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     // Negative when inside the border
     float border_sdf = max(inner_sdf, outer_sdf);
 
-    // A rounded box with a border that lies between pixels (a paint transform) has its background
-    // clipped by the same antialiased rounded rect it is filled with, as Blink clips it to avoid a
-    // background bleeding past the border: at the outer edge it counts its coverage twice.
     float coverage = saturate(antialias_threshold - outer_sdf);
     float4 background = background_color;
-    bool bordered = max(max(quad.border_widths.top, quad.border_widths.bottom),
-        max(quad.border_widths.left, quad.border_widths.right)) > 0.0;
-    if (!whole && !unrounded && bordered && coverage > 0.0) {
-        background.a *= coverage;
-    }
 
     float4 color = background;
     if (border_sdf < antialias_threshold) {
@@ -1123,9 +1671,16 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         // A drop shadow is drawn only outside its box, cut by the box's own antialiased edge, as a
         // browser clips it: a corner pixel the box half covers keeps half the shadow under it, and a
         // translucent box does not show its own shadow through its fill.
-        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
-                                          shadow.element_corner_radii);
-        alpha *= 1.0 - saturate(0.5 - element_distance);
+        Bounds element = shadow.element_bounds;
+        Corners radii = shadow.element_corner_radii;
+        bool whole = all(frac(element.origin) == float2(0.0, 0.0)) && all(frac(element.size) == float2(0.0, 0.0));
+        bool rounded = max(max(radii.top_left, radii.top_right), max(radii.bottom_right, radii.bottom_left)) > 0.0;
+        if (!whole && rounded) {
+            alpha *= 1.0 - aaa_rrect(floor(input.position.xy), element, radii, true);
+        } else {
+            float element_distance = quad_sdf(input.position.xy, element, radii);
+            alpha *= 1.0 - saturate(0.5 - element_distance);
+        }
     }
 
     return input.color * float4(1., 1., 1., alpha);
